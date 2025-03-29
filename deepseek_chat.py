@@ -2,7 +2,7 @@ import os
 import openai
 
 # Get API key from environment variable
-api_key = os.environ.get("DEEPSEEK_API_KEY")
+api_key = "sk-5ec02f12083d4f97aad73e1adb3a6f48"
 if not api_key:
     api_key = input("Please enter your DeepSeek API key: ")
     os.environ["DEEPSEEK_API_KEY"] = api_key
