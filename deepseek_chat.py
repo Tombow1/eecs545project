@@ -5,17 +5,24 @@ import faiss
 import datetime
 import threading
 import tiktoken
+import re
+from transformers import pipeline, BartTokenizer
+from thefuzz import fuzz
+import google.generativeai as genai
+import openai
+
+
+# For fuzzy tag matching
+from thefuzz import fuzz
 
 # ---------------------------
 # Gemini Embedding Configuration
 # ---------------------------
 import google.generativeai as genai
 
-# Hardcode the Gemini API key for testing purposes.
+# Example key; do not hardcode in production
 GEMINI_API_KEY = "AIzaSyDm3hL9ZMIjdz8gI0-Q0wkpuY9SdGYtpuA"
 os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
-
-# Configure the Gemini client globally.
 genai.configure(api_key=GEMINI_API_KEY)
 
 # ---------------------------
@@ -23,25 +30,25 @@ genai.configure(api_key=GEMINI_API_KEY)
 # ---------------------------
 import openai
 
-# Hardcode DeepSeek API key for testing.
+# Example key; do not hardcode in production
 openai_api_key = "sk-5ec02f12083d4f97aad73e1adb3a6f48"
 os.environ["DEEPSEEK_API_KEY"] = openai_api_key
 
 openai.api_key = openai_api_key
 client = openai.OpenAI(
     api_key=openai_api_key,
-    base_url="https://api.deepseek.com"  # DeepSeek API endpoint
+    base_url="https://api.deepseek.com"  # Adjust if needed
 )
 
 # ---------------------------
 # Vector Database Setup
 # ---------------------------
-embedding_dim = 3072  # Adjust if Gemini returns a different dimension
+embedding_dim = 3072  # For gemini-embedding-exp-03-07
 index_file = "memory.index"
 metadata_file = "memory_meta.json"
 index_lock = threading.Lock()
 
-# In-memory cache for embeddings to avoid repeated API calls.
+# Cache to avoid re-embedding repeated text
 embedding_cache = {}
 
 if os.path.exists(index_file) and os.path.exists(metadata_file):
@@ -60,7 +67,9 @@ else:
     metadata = []
     print("Initialized new memory index.")
 
+
 def save_index():
+    """Persist the Faiss index and metadata to disk."""
     try:
         with index_lock:
             faiss.write_index(index, index_file)
@@ -70,153 +79,256 @@ def save_index():
     except Exception as e:
         print("Error saving index:", e)
 
+
+# ---------------------------
+# Basic Tag Extraction
+# ---------------------------
+def extract_tags(text):
+    """
+    Trivial example: split on alphanumeric, keep unique tokens of length >= 4 for 'tags'.
+    In production, you might use a more robust approach 
+    (keyword extraction, spaCy-based NER, etc.).
+    """
+    text_lower = text.lower()
+    tokens = re.findall(r"\w+", text_lower)
+    tokens = [t for t in tokens if len(t) >= 4]
+    return list(set(tokens))
+
+
 # ---------------------------
 # Gemini Embedding Functions
 # ---------------------------
 def get_text_embedding(text):
     """
-    Compute text embedding using Gemini's embedding model.
-    Utilizes caching to avoid redundant API calls.
+    Compute text embedding using Gemini's embedding model,
+    optionally L2-normalize for better semantic search with Faiss (IndexFlatL2).
     """
     if text in embedding_cache:
         return embedding_cache[text]
+
     try:
         result = genai.embed_content(
             model="models/gemini-embedding-exp-03-07",
             content=text
         )
-        # Assume the embedding is returned under the key 'embedding'
-        embedding = np.array(result['embedding'], dtype=np.float32)
-        # Adjust embedding size if necessary.
-        if embedding.shape[0] != embedding_dim:
-            if embedding.shape[0] < embedding_dim:
-                padded = np.zeros((embedding_dim,), dtype=np.float32)
-                padded[:embedding.shape[0]] = embedding
-                embedding = padded
-            else:
-                embedding = embedding[:embedding_dim]
-        embedding_cache[text] = embedding
-        return embedding
+        embedding_array = np.array(result["embedding"], dtype=np.float32)
+
+        # Optional L2 normalization
+        norm = np.linalg.norm(embedding_array)
+        if norm > 0:
+            embedding_array = embedding_array / norm
+
+        embedding_cache[text] = embedding_array
+        return embedding_array
+
     except Exception as e:
         print("Error getting text embedding:", e)
         return np.zeros((embedding_dim,), dtype=np.float32)
 
-def get_text_embeddings_batch(texts):
-    """Process a batch of texts to obtain embeddings in one API call."""
-    new_texts = [txt for txt in texts if txt not in embedding_cache]
-    embeddings = {}
-    if new_texts:
-        try:
-            result = genai.embed_content(
-                model="models/gemini-embedding-exp-03-07",
-                content=new_texts
-            )
-            for i, txt in enumerate(new_texts):
-                embeddings[txt] = np.array(result['embedding'][i], dtype=np.float32)
-                embedding_cache[txt] = embeddings[txt]
-        except Exception as e:
-            print("Error during batch embedding:", e)
-            for txt in new_texts:
-                embeddings[txt] = np.zeros((embedding_dim,), dtype=np.float32)
-    return [embedding_cache[txt] for txt in texts]
 
 # ---------------------------
-# Memory Management Functions with Additional Metadata
+# Memory Management Functions
 # ---------------------------
+memory_enabled = True
+
+def toggle_memory(state: bool):
+    global memory_enabled
+    memory_enabled = state
+    status = "enabled" if state else "disabled"
+    print(f"Memory recording has been {status}.")
+
+
 def add_to_memory(text, source="unknown", user_id=None, tags=None):
     """
-    Add an entry to the persistent memory.
-    Optional parameters:
-      - user_id: to associate memory with a specific user.
-      - tags: a list of tags (e.g., ["preference", "laptop"]).
-    Only records if memory_enabled is True.
+    Add an entry to the persistent memory (Faiss index + metadata).
+    We also auto-extract tags from `text` if not provided.
     """
     if not memory_enabled:
         return
+
     embedding = get_text_embedding(text)
     vec = embedding.reshape(1, -1)
     with index_lock:
         index.add(vec)
+
+    auto_tags = extract_tags(text)
+    combined_tags = list(set(auto_tags + (tags or [])))
+
     entry = {
         "text": text,
         "source": source,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "user_id": user_id,
-        "tags": tags or []
+        "tags": combined_tags
     }
     metadata.append(entry)
     save_index()
     print("Added memory:", entry)
 
+
 def is_personal_preference_query(query):
     """
-    Determine if the query indicates a personal preference inquiry.
+    Detect a personal preference inquiry to apply a weighting boost.
     """
     keywords = ["fav", "favorite", "like", "prefer", "my preference"]
-    return any(kw in query.lower() for kw in keywords)
+    q_lower = query.lower()
+    return any(kw in q_lower for kw in keywords)
 
-def retrieve_from_memory(query, top_k=3):
+
+# ---------------------------
+# Fuzzy Overlap Helper
+# ---------------------------
+def fuzzy_tag_overlap(entry_tags, query_tags, threshold=80):
+    """
+    Return how many 'fuzzy-matched' tags we find between two sets of tags.
+    E.g. if entry has ["macbook"] and query has ["macbok"], 
+    ratio might be >= 80 -> counts as match.
+    """
+    overlap_count = 0
+    for qtag in query_tags:
+        for etag in entry_tags:
+            score = fuzz.ratio(qtag, etag)
+            if score >= threshold:
+                overlap_count += 1
+                break
+    return overlap_count
+
+
+def retrieve_from_memory(query, top_k=None):
+    """
+    Perform a semantic search over ALL stored memory.
+    If top_k is None, we retrieve everything from the index,
+    then re-rank by distance, recency, preference, plus fuzzy tag overlap.
+    """
+    if len(metadata) == 0:
+        return []
+
     query_embedding = get_text_embedding(query).reshape(1, -1)
     with index_lock:
-        distances, indices = index.search(query_embedding, top_k)
+        k = top_k if top_k is not None else index.ntotal
+        distances, indices = index.search(query_embedding, k)
+
+    query_tags = extract_tags(query)
     results = []
-    # Collect results along with recency and, if applicable, preference match bonus.
-    for idx in indices[0]:
-        if idx < len(metadata):
+    for i, idx in enumerate(indices[0]):
+        if 0 <= idx < len(metadata):
             entry = metadata[idx]
+            distance = distances[0][i]
+            # Convert L2 distance to a "similarity" style
+            base_score = 1.0 / (1.0 + distance)
+
             time_obj = datetime.datetime.fromisoformat(entry["timestamp"])
             age_seconds = (datetime.datetime.now(datetime.timezone.utc) - time_obj).total_seconds()
-            # Base weight: newer entries get higher weight.
-            weight = 1 / (1 + age_seconds/3600)
-            # If the query seems to be about personal preferences and the entry has a "preference" tag, boost its weight.
-            if is_personal_preference_query(query) and "preference" in entry.get("tags", []):
-                weight *= 1.5
-            results.append((entry, weight))
+            recency_weight = 1 / (1 + (age_seconds / 3600.0))
+
+            preference_boost = 1.0
+            if is_personal_preference_query(query) and ("preference" in entry["tags"]):
+                preference_boost = 1.5
+
+            overlap_count = fuzzy_tag_overlap(entry["tags"], query_tags, threshold=80)
+            tag_boost = 1.0 + 0.1 * overlap_count
+
+            final_score = base_score * recency_weight * preference_boost * tag_boost
+            results.append((entry, final_score))
+
     results.sort(key=lambda x: x[1], reverse=True)
-    return [entry for entry, _ in results]
+    return [r[0] for r in results]
+
 
 # ---------------------------
-# Accurate Token Counting with tiktoken
+# Token Counting & Summaries
 # ---------------------------
-def count_tokens(text, model="text-davinci-003"):
+bart_tokenizer = BartTokenizer.from_pretrained("facebook/bart-large-cnn")
+
+def count_tokens(text, model="facebook/bart-large-cnn"):
     try:
-        encoding = tiktoken.encoding_for_model(model)
-        tokens = encoding.encode(text)
-        return len(tokens)
+        if model == "facebook/bart-large-cnn":
+            tokens = bart_tokenizer.tokenize(text)
+            return len(tokens)
+        else:
+            encoding = tiktoken.encoding_for_model(model)
+            tokens = encoding.encode(text)
+            return len(tokens)
     except Exception as e:
         print("Error counting tokens:", e)
-        return len(text) // 4
+        return len(text.split())
 
-def approximate_history_token_count(messages, model="text-davinci-003"):
+
+def approximate_history_token_count(messages, model="facebook/bart-large-cnn"):
     return sum(count_tokens(msg["content"], model) for msg in messages)
 
-# ---------------------------
-# Advanced Prompt Management: Adaptive Summarization
-# ---------------------------
+
 MAX_HISTORY_TOKENS = 3000
 
-def summarize_text(text):
-    """
-    Summarize the provided text using OpenAI's completion API.
-    In production, consider using a local summarization model to reduce latency.
-    """
-    try:
-        prompt = "Summarize the following conversation concisely:\n\n" + text
-        response = openai.Completion.create(
-            engine="text-davinci-003",
-            prompt=prompt,
-            max_tokens=150,
-            temperature=0.5,
-            n=1,
-            stop=None,
-        )
-        summary = response.choices[0].text.strip()
-        return summary
-    except Exception as e:
-        print("Error during summarization:", e)
-        return text
+# Summarization pipeline on GPU (device=0).
+bart_summarizer = pipeline(
+    "summarization",
+    model="facebook/bart-large-cnn",
+    tokenizer=bart_tokenizer,
+    device=0,             # keep on GPU
+    max_length=150,       # max output length for summary
+    truncation=True
+)
 
-def prune_history(messages, model="text-davinci-003"):
+# ---------------------------
+# CHUNKING-BASED SUMMARIZATION
+# ---------------------------
+def chunk_text(text, tokenizer, chunk_size=512): # 1024
+    """
+    Split text into multiple chunks of up to `chunk_size` tokens each
+    so we don't overflow the model's input limit.
+    """
+    all_ids = tokenizer.encode(text, add_special_tokens=False)
+    chunks = []
+    for i in range(0, len(all_ids), chunk_size):
+        chunks.append(all_ids[i : i + chunk_size])
+    return chunks
+
+
+def summarize_chunk(token_ids, tokenizer, summarizer):
+    """
+    Summarize a single chunk of token IDs.
+    """
+    chunk_text = tokenizer.decode(token_ids, skip_special_tokens=True)
+    # Summarize the chunk
+    out = summarizer(chunk_text, do_sample=False, min_length=40)
+    return out[0]["summary_text"].strip()
+
+
+def chunked_summarize(text, chunk_size=512, pass_count=2):
+    # Each pass chunk-summarizes the text, then feeds the combined summary
+    # into the next pass if there's more than 1 chunk.
+
+    for _ in range(pass_count):
+        token_ids = bart_tokenizer.encode(text, add_special_tokens=False)
+        chunks = [
+            token_ids[i : i + chunk_size]
+            for i in range(0, len(token_ids), chunk_size)
+        ]
+        partial_summaries = []
+        for c in chunks:
+            c_text = bart_tokenizer.decode(c, skip_special_tokens=True)
+            try:
+                out = bart_summarizer(c_text, do_sample=False, min_length=30, max_length=120)
+                partial_summaries.append(out[0]["summary_text"].strip())
+            except Exception as e:
+                print("Error summarizing chunk:", e)
+                partial_summaries.append(c_text)  # fallback: keep raw text if chunk fails
+
+        text = "\n".join(partial_summaries)
+
+        # if there's only one chunk, we've effectively done final summarization
+        if len(chunks) == 1:
+            break
+
+    return text
+
+
+def prune_history(messages, model="facebook/bart-large-cnn"):
+    """
+    If chat history is too large, summarize older chunks.
+    Uses chunked_summarize() to handle very large text.
+    """
     token_count = approximate_history_token_count(messages, model)
     if token_count <= MAX_HISTORY_TOKENS:
         return messages
@@ -235,45 +347,47 @@ def prune_history(messages, model="text-davinci-003"):
             break
 
     if cutoff_index > 0:
+        # Summarize everything up to cutoff_index with chunked summarization
         concatenated = "\n".join(msg["content"] for msg in recent_messages[:cutoff_index])
-        summary = summarize_text(concatenated)
-        pruned_history = [system_message, {"role": "summary", "content": summary}]
+        summary = chunked_summarize(concatenated)
+
+        # We store the summary as an assistant message so we remain valid for the model
+        pruned_history = [
+            system_message,
+            {"role": "assistant", "content": summary}
+        ]
         pruned_history.extend(recent_messages[cutoff_index:])
+
         if approximate_history_token_count(pruned_history, model) > MAX_HISTORY_TOKENS:
             print("Warning: History still exceeds token limit after summarization.")
         return pruned_history
     else:
         return messages
 
-# ---------------------------
-# Memory Recording Control Flag
-# ---------------------------
-memory_enabled = True  # Global flag for memory recording.
-
-def toggle_memory(state: bool):
-    global memory_enabled
-    memory_enabled = state
-    status = "enabled" if state else "disabled"
-    print(f"Memory recording has been {status}.")
 
 # ---------------------------
-# Chat Wrapper with Enhanced Features
+# Main Chat Loop
 # ---------------------------
 messages = [
-    {"role": "system", "content": "You are a helpful assistant."}
+    {
+        "role": "system",
+        "content": (
+            "You are a helpful assistant with access to a vector-memory system. "
+            "Use the retrieved memory context if relevant."
+        )
+    }
 ]
 
-print("Interactive DeepSeek Chat with Enhanced Memory & Prompt Management (type 'exit' to quit)")
+print("Interactive DeepSeek Chat with Hybrid Fuzzy Tag + Vector Search & Chunked Summaries (type 'exit' to quit)")
 print("Type 'stop recording memory' to disable memory logging, and 'resume recording memory' to enable it.")
 print("------------------------------------------------------------")
 
 while True:
     user_input = input("\nUser: ")
-    if user_input.lower() in ['exit', 'quit', 'bye']:
+    if user_input.lower() in ["exit", "quit", "bye"]:
         print("\nGoodbye!")
         break
 
-    # Check for memory control commands.
     if user_input.lower() == "stop recording memory":
         toggle_memory(False)
         continue
@@ -281,23 +395,38 @@ while True:
         toggle_memory(True)
         continue
 
-    messages.append({"role": "user", "content": user_input})
-    add_to_memory("User: " + user_input, source="user", user_id="test_user", tags=["preference"] if "macbook" in user_input.lower() else [])
+    # Add the user's raw text to memory (with auto-tagging)
+    custom_tags = []
+    # Example: if "macbook" in user_input => custom_tags = ["preference"]
+    if "macbook" in user_input.lower() or "macbooks" in user_input.lower():
+        custom_tags.append("preference")
 
-    # For personal preference queries, reformulate the query to be more explicit.
+    add_to_memory(user_input, source="user", user_id="test_user", tags=custom_tags)
+
+    # If user is asking about personal preferences, reformulate slightly
     if is_personal_preference_query(user_input):
         reformulated_query = user_input + " (based on my preferences)"
     else:
         reformulated_query = user_input
 
-    retrieved_entries = retrieve_from_memory(reformulated_query, top_k=3)
-    retrieved_context = " ".join(entry["text"] for entry in retrieved_entries)
-    
-    augmented_input = retrieved_context + " " + user_input
-    messages[-1]["content"] = augmented_input
+    # Retrieve memory (all)
+    all_entries = retrieve_from_memory(reformulated_query, top_k=None)
+    top_entries = all_entries[:5]
 
+    # Combine top matches into snippet
+    retrieved_context = "\n".join(
+        f"Relevant Memory: {entry['text']} [tags={entry['tags']}]"
+        for entry in top_entries
+    )
+
+    # Place memory context + user message into the conversation
+    augmented_input = f"{retrieved_context}\n\nUser's current message: {user_input}"
+    messages.append({"role": "user", "content": augmented_input})
+
+    # Prune conversation with chunked summarization
     messages = prune_history(messages)
 
+    # Send to DeepSeek for streaming chat completion
     try:
         print("\nDeepSeek: ", end="", flush=True)
         stream = client.chat.completions.create(
@@ -305,17 +434,18 @@ while True:
             messages=messages,
             stream=True
         )
-        
+
         assistant_response = ""
         for chunk in stream:
             if chunk.choices[0].delta.content is not None:
-                content_chunk = chunk.choices[0].delta.content
-                assistant_response += content_chunk
-                print(content_chunk, end="", flush=True)
+                piece = chunk.choices[0].delta.content
+                assistant_response += piece
+                print(piece, end="", flush=True)
         print()
-        
+
+        # Record assistant response in memory as well
         messages.append({"role": "assistant", "content": assistant_response})
-        add_to_memory("Assistant: " + assistant_response, source="assistant", user_id="test_user")
-        
+        add_to_memory(assistant_response, source="assistant", user_id="test_user")
+
     except Exception as e:
         print(f"\nError during API call: {str(e)}")
