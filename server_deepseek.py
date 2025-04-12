@@ -28,8 +28,6 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[Message]
     stream: Optional[bool] = False
-    user: Optional[str] = None
-    memory_enabled: Optional[bool] = True
     
 # ---------------------------
 # Gemini Embedding Configuration
@@ -361,44 +359,42 @@ async def chat_completions(request: ChatCompletionRequest):
     if not user_message:
         return {"error": "No user message found"}
     
-    user_id = request.user or "default_user"
-    memory_enabled = request.memory_enabled
+    user_id = "default_user"  # Fixed user ID as we're not tracking individual users
     
-    # Process with memory if enabled
-    if memory_enabled:
-        # Add user message to memory
-        custom_tags = []
-        if "macbook" in user_message.content.lower() or "macbooks" in user_message.content.lower():
-            custom_tags.append("preference")
-            
-        add_to_memory(user_message.content, source="user", user_id=user_id, tags=custom_tags)
+    # Always process with memory
+    # Add user message to memory
+    custom_tags = []
+    if "macbook" in user_message.content.lower() or "macbooks" in user_message.content.lower():
+        custom_tags.append("preference")
         
-        # Retrieve relevant memories
-        if is_personal_preference_query(user_message.content):
-            reformulated_query = user_message.content + " (based on my preferences)"
-        else:
-            reformulated_query = user_message.content
-            
-        top_entries = retrieve_from_memory(reformulated_query, user_id=user_id, top_k=5)
+    add_to_memory(user_message.content, source="user", user_id=user_id, tags=custom_tags)
+    
+    # Retrieve relevant memories
+    if is_personal_preference_query(user_message.content):
+        reformulated_query = user_message.content + " (based on my preferences)"
+    else:
+        reformulated_query = user_message.content
         
-        # Combine top matches into context
-        if top_entries:
-            retrieved_context = "\n".join(
-                f"Relevant Memory: {entry['text']} [tags={entry['tags']}]"
-                for entry in top_entries
-            )
-            
-            # Augment the user's message with memory context
-            augmented_content = f"{retrieved_context}\n\nUser's current message: {user_message.content}"
-            
-            # Replace the original user message with the augmented one
-            for i, msg in enumerate(request.messages):
-                if msg.role == "user" and msg.content == user_message.content:
-                    request.messages[i].content = augmented_content
-                    break
+    top_entries = retrieve_from_memory(reformulated_query, user_id=user_id, top_k=5)
+    
+    # Combine top matches into context
+    if top_entries:
+        retrieved_context = "\n".join(
+            f"Relevant Memory: {entry['text']} [tags={entry['tags']}]"
+            for entry in top_entries
+        )
         
-        # Prune history if needed
-        request.messages = prune_history(request.messages)
+        # Augment the user's message with memory context
+        augmented_content = f"{retrieved_context}\n\nUser's current message: {user_message.content}"
+        
+        # Replace the original user message with the augmented one
+        for i, msg in enumerate(request.messages):
+            if msg.role == "user" and msg.content == user_message.content:
+                request.messages[i].content = augmented_content
+                break
+    
+    # Prune history if needed
+    request.messages = prune_history(request.messages)
     
     # Handle streaming response if requested
     if request.stream:
@@ -415,8 +411,8 @@ async def chat_completions(request: ChatCompletionRequest):
             stream=False
         )
         
-        # Store assistant's response in memory if enabled
-        if memory_enabled and completion.choices:
+        # Always store assistant's response in memory
+        if completion.choices:
             assistant_response = completion.choices[0].message.content
             add_to_memory(assistant_response, source="assistant", user_id=user_id)
         
@@ -443,8 +439,7 @@ async def stream_completion(request: ChatCompletionRequest):
     """
     Stream the completion response.
     """
-    user_id = request.user or "default_user"
-    memory_enabled = request.memory_enabled
+    user_id = "default_user"
     
     try:
         stream = deepseek_client.chat.completions.create(
@@ -462,8 +457,8 @@ async def stream_completion(request: ChatCompletionRequest):
                 # Format as SSE
                 yield f"data: {json.dumps({'choices': [{'delta': {'content': piece}}]})}\n\n"
         
-        # Store complete response in memory
-        if memory_enabled and assistant_response:
+        # Always store complete response in memory
+        if assistant_response:
             add_to_memory(assistant_response, source="assistant", user_id=user_id)
             
         yield "data: [DONE]\n\n"
@@ -481,52 +476,22 @@ async def memory_status():
         "index_size": index.ntotal if hasattr(index, "ntotal") else 0
     }
 
-@app.post("/memory/clear/{user_id}")
-async def clear_user_memory(user_id: str):
+@app.post("/memory/clear")
+async def clear_memory():
     """
-    Clear memory for a specific user.
+    Clear all memory. Since we're not tracking individual users, this clears everything.
     """
     global metadata, index
     
-    # Filter out entries for this user
+    # Clear all memory
     with index_lock:
-        # First get indices of entries to keep
-        keep_indices = []
-        new_metadata = []
+        # Initialize empty index and metadata
+        index = faiss.IndexFlatL2(embedding_dim)
+        metadata = []
         
-        for i, entry in enumerate(metadata):
-            if entry.get("user_id") != user_id:
-                keep_indices.append(i)
-                new_metadata.append(entry)
-        
-        if len(keep_indices) < len(metadata):
-            # We need to rebuild the index
-            if keep_indices:
-                # Get embeddings for entries we're keeping
-                embeddings = []
-                for idx in keep_indices:
-                    text = metadata[idx]["text"]
-                    embedding = get_text_embedding(text)
-                    embeddings.append(embedding)
-                
-                # Build new index
-                new_index = faiss.IndexFlatL2(embedding_dim)
-                embeddings_array = np.vstack(embeddings)
-                new_index.add(embeddings_array)
-                
-                # Replace old index and metadata
-                index = new_index
-                metadata = new_metadata
-            else:
-                # No entries left, initialize empty
-                index = faiss.IndexFlatL2(embedding_dim)
-                metadata = []
-                
-            # Save changes
-            save_index()
-            return {"status": "success", "message": f"Memory cleared for user {user_id}"}
-        
-        return {"status": "info", "message": f"No memory entries found for user {user_id}"}
+        # Save changes
+        save_index()
+        return {"status": "success", "message": "All memory cleared"}
 
 if __name__ == "__main__":
     uvicorn.run("memory_api:app", host="127.0.0.1", port=8000, reload=True)
