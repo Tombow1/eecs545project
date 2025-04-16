@@ -43,6 +43,7 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = 0.0
     functions: Optional[List[Function]] = None
     function_call: Optional[Union[str, Dict[str, Any]]] = None
+    stop: Optional[Union[str, List[str]]] = None  # Added stop parameter
     user: Optional[str] = None
 
 # -----------------------------
@@ -75,11 +76,23 @@ async def chat_completions(request: ChatCompletionRequest):
         if request.stream:
             def event_stream():
                 try:
+                    # In the streaming section
                     stream = chat_with_memory_streaming(
                         messages=messages,
                         model=request.model,
                         temperature=request.temperature,
                         max_tokens=request.max_tokens,
+                        stop=request.stop,  # Added stop parameter
+                        user=request.user
+                    )
+                    
+                    # In the non-streaming section
+                    content = chat_with_memory(
+                        messages=messages,
+                        model=request.model,
+                        temperature=request.temperature,
+                        max_tokens=request.max_tokens,
+                        stop=request.stop,  # Added stop parameter
                         user=request.user
                     )
                     
