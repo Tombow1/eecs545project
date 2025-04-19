@@ -10,11 +10,17 @@ from transformers import pipeline, BartTokenizer
 from thefuzz import fuzz
 import google.generativeai as genai
 import openai
-
-
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Iterable, List, Optional, Union
+from starlette.responses import StreamingResponse, JSONResponse
+#from deepseek_chat import chat_with_memory
+import time
+import json
 # For fuzzy tag matching
 from thefuzz import fuzz
-
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 # ---------------------------
 # Gemini Embedding Configuration
 # ---------------------------
@@ -325,10 +331,6 @@ def chunked_summarize(text, chunk_size=512, pass_count=2):
 
 
 def prune_history(messages, model="facebook/bart-large-cnn"):
-    """
-    If chat history is too large, summarize older chunks.
-    Uses chunked_summarize() to handle very large text.
-    """
     token_count = approximate_history_token_count(messages, model)
     if token_count <= MAX_HISTORY_TOKENS:
         return messages
@@ -347,59 +349,65 @@ def prune_history(messages, model="facebook/bart-large-cnn"):
             break
 
     if cutoff_index > 0:
-        # Summarize everything up to cutoff_index with chunked summarization
-        concatenated = "\n".join(msg["content"] for msg in recent_messages[:cutoff_index])
+        # Get messages to summarize
+        messages_to_summarize = recent_messages[:cutoff_index]
+
+        # ⚠️ Skip non-user messages for the first message
+        while messages_to_summarize and messages_to_summarize[0]["role"] != "user":
+            messages_to_summarize = messages_to_summarize[1:]
+
+        # Now safely summarize
+        concatenated = "\n".join(msg["content"] for msg in messages_to_summarize)
         summary = chunked_summarize(concatenated)
 
-        # We store the summary as an assistant message so we remain valid for the model
+
         pruned_history = [
             system_message,
-            {"role": "assistant", "content": summary}
+            {"role": "assistant", "content": f"(Summary of earlier messages)\n{summary}"}
         ]
-        pruned_history.extend(recent_messages[cutoff_index:])
+        pruned_history = recent_messages[cutoff_index:].extend(pruned_history)
 
-        if approximate_history_token_count(pruned_history, model) > MAX_HISTORY_TOKENS:
-            print("Warning: History still exceeds token limit after summarization.")
         return pruned_history
     else:
         return messages
 
 
-# ---------------------------
-# Main Chat Loop
-# ---------------------------
-messages = [
-    {
-        "role": "system",
-        "content": (
-            "You are a helpful assistant with access to a vector-memory system. "
-            "Use the retrieved memory context if relevant."
-        )
-    }
-]
 
-print("Interactive DeepSeek Chat with Hybrid Fuzzy Tag + Vector Search & Chunked Summaries (type 'exit' to quit)")
-print("Type 'stop recording memory' to disable memory logging, and 'resume recording memory' to enable it.")
-print("------------------------------------------------------------")
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import Iterable, List, Optional, Union
+from starlette.responses import StreamingResponse, JSONResponse
+import time
+import json
 
-while True:
-    user_input = input("\nUser: ")
-    if user_input.lower() in ["exit", "quit", "bye"]:
-        print("\nGoodbye!")
-        break
+# -----------------------------
+# OpenAI-compatible Request Format
+# -----------------------------
 
-    if user_input.lower() == "stop recording memory":
-        toggle_memory(False)
-        continue
-    elif user_input.lower() == "resume recording memory":
-        toggle_memory(True)
-        continue
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: list[dict[str, str]]
+    stream: Optional[bool] = False
+    temperature: Optional[float] = 1.0
+    max_tokens: Optional[int] = 512
+    top_p: Optional[float] = 1.0
+    frequency_penalty: Optional[float] = 0.0
+    presence_penalty: Optional[float] = 0.0
+    stop: Optional[Union[str, List[str]]] = None
 
-    # Add the user's raw text to memory (with auto-tagging)
+
+# -----------------------------
+# FastAPI Setup
+# -----------------------------
+app = FastAPI()
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
+
+    messages = request.messages
+    user_input = " ".join(m["content"] for m in messages if m["role"] == "user")
+    
     custom_tags = []
-    # Example: if "macbook" in user_input => custom_tags = ["preference"]
-    if "macbook" in user_input.lower() or "macbooks" in user_input.lower():
-        custom_tags.append("preference")
 
     add_to_memory(user_input, source="user", user_id="test_user", tags=custom_tags)
 
@@ -421,31 +429,32 @@ while True:
 
     # Place memory context + user message into the conversation
     augmented_input = f"{retrieved_context}\n\nUser's current message: {user_input}"
-    messages.append({"role": "user", "content": augmented_input})
+
+    # Replace the last user message instead of appending
+    for i in reversed(range(len(messages))):
+        if messages[i]["role"] == "user":
+            messages[i]["content"] = augmented_input
+            break
 
     # Prune conversation with chunked summarization
     messages = prune_history(messages)
-
+    print(messages)
     # Send to DeepSeek for streaming chat completion
-    try:
-        print("\nDeepSeek: ", end="", flush=True)
-        stream = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=messages,
-            stream=True
-        )
+    assistant_response = client.chat.completions.create(
+        model="deepseek-reasoner",
+        messages=messages,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        top_p=request.top_p
+    )
 
-        assistant_response = ""
-        for chunk in stream:
-            if chunk.choices[0].delta.content is not None:
-                piece = chunk.choices[0].delta.content
-                assistant_response += piece
-                print(piece, end="", flush=True)
-        print()
+    # Record assistant response in memory as well
+    messages.append({"role": "assistant", "content": assistant_response.choices[0].message.content})
+    add_to_memory(assistant_response.choices[0].message.content, source="assistant", user_id="test_user")
+    
+    return assistant_response
 
-        # Record assistant response in memory as well
-        messages.append({"role": "assistant", "content": assistant_response})
-        add_to_memory(assistant_response, source="assistant", user_id="test_user")
 
-    except Exception as e:
-        print(f"\nError during API call: {str(e)}")
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("deepseek_chat:app", host="127.0.0.1", port=8000)
