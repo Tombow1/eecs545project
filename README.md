@@ -162,10 +162,10 @@ The top‑*k* (default = 5) entries are concatenated above the live user promp
 If you use this code in academic work, please cite:
 ```text
 @misc{deepseek_memory_2025,
-  author = {Your Name},
+  author = {Rajdeep Mukherjee, Ziyao Yan, Adarsh Bharathwaj, Cal Kantamneni, Tod Manlaibaatar},
   title  = {Memory‑Enhanced Multimodal DeepSeek Chat},
   year   = {2025},
-  url    = {https://github.com/YOUR‑HANDLE/deepseek‑memory}
+  url    = {https://github.com/Tombow1/eecs545project}
 }
 ```
 
