@@ -1,3 +1,8 @@
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any, Union
+import uvicorn
 import os
 import json
 import numpy as np
@@ -6,114 +11,55 @@ import datetime
 import threading
 import tiktoken
 import re
+import time
 from transformers import pipeline, BartTokenizer
 from thefuzz import fuzz
 import google.generativeai as genai
 import openai
-import torch
+import asyncio
+from starlette.responses import StreamingResponse
 
+# ---------------------------
+# Schema Definitions
+# ---------------------------
+class Message(BaseModel):
+    role: str
+    content: str
 
-# For fuzzy tag matching
-from thefuzz import fuzz
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[Message]
+    stream: Optional[bool] = False
+    temperature: Optional[float] = 0.7
+    max_tokens: Optional[int] = None
+
+class MemoryEntry(BaseModel):
+    text: str
+    source: str = "unknown"
+    user_id: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+class MemorySearchRequest(BaseModel):
+    query: str
+    top_k: Optional[int] = 5
+    user_id: Optional[str] = None
+
+class MemoryToggleRequest(BaseModel):
+    enabled: bool
 
 # ---------------------------
 # Gemini Embedding Configuration
 # ---------------------------
-import google.generativeai as genai
-# ───────────────────────────────────────────────────────────────────────────────
-# Multimodal Helpers  —  OLLAMA PYTHON CLIENT (llama3.2‑vision)
-# ───────────────────────────────────────────────────────────────────────────────
-import ollama                                                         # NEW
-
-OLLAMA_MODEL = "llama3.2-vision:90b"      # ← EXACT tag shown by `ollama list`
-                                      #   (add :Q4_K_M or :90b if that's what you have)
-
-def describe_image_with_llama(path: str,
-                              prompt: str = "Describe this image in detail.") -> str:
-    """
-    Call the vision‑capable Llama 3.2 model via ollama.chat() and return the text.
-    """
-    messages = [
-        {
-            "role":    "user",
-            "content": prompt,
-            "images":  [path]          # Ollama client will load & encode the file
-        }
-    ]
-    try:
-        response = ollama.chat(model=OLLAMA_MODEL, messages=messages)
-        # `response` is a dict like: {'message': {'role': 'assistant', 'content': '...'}}
-        return response.get("message", {}).get("content", str(response)).strip()
-    except Exception as exc:
-        return f"[ERROR contacting Ollama] {exc}"
-
-def add_image_to_memory(path: str,
-                        prompt: str = "Describe this image in detail.",
-                        user_id: str = "gui_user") -> str:
-    """
-    Convenience: run vision model, add result to Faiss memory, return text.
-    """
-    description = describe_image_with_llama(path, prompt)
-    add_to_memory(description, source="image", user_id=user_id, tags=["image_analysis"])
-    return description
-
-# ─────────────────────────────────────────────────────────────────────
-# 7)  AUDIO  → text  (HF Whisper‑large‑v3)
-# ─────────────────────────────────────────────────────────────────────
-HF_MODEL_ID = "openai/whisper-large-v3"
-_whisper_pipe = None
-
-
-def _get_whisper_pipe():
-    global _whisper_pipe
-    if _whisper_pipe is None:
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        model = pipeline(
-            "automatic-speech-recognition",
-            model=HF_MODEL_ID,
-            torch_dtype=dtype,
-            device=0 if torch.cuda.is_available() else -1
-        )
-        _whisper_pipe = model
-    return _whisper_pipe
-
-
-def transcribe_audio(path: str) -> str:
-    try:
-        pipe = _get_whisper_pipe()
-        out = pipe(path, return_timestamps=True)
-        return out["text"].strip()
-    except Exception as e:
-        return f"[ERROR transcribing audio] {e}"
-
-
-def add_audio_to_memory(path: str):
-    txt = transcribe_audio(path)
-    add_to_memory(txt, source="audio", tags=["audio_transcript"])
-    return txt
-
-
-# ─────────────────────────────────────────────────────────────────────
-
-
-# Example key; do not hardcode in production
-GEMINI_API_KEY = "AIzaSyAJoyB3HNpInQgGqXeM_t2t3z78Zf5eCDc"
-os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDm3hL9ZMIjdz8gI0-Q0wkpuY9SdGYtpuA")
 genai.configure(api_key=GEMINI_API_KEY)
 
 # ---------------------------
 # Chat API Client Configuration (DeepSeek)
 # ---------------------------
-import openai
-
-# Example key; do not hardcode in production
-openai_api_key = "sk-1a85e3e5f39f4b2587615e72c99aa63e"
-os.environ["DEEPSEEK_API_KEY"] = openai_api_key
-
-openai.api_key = openai_api_key
-client = openai.OpenAI(
-    api_key=openai_api_key,
-    base_url="https://api.deepseek.com"  # Adjust if needed
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-5ec02f12083d4f97aad73e1adb3a6f48")
+deepseek_client = openai.OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com"
 )
 
 # ---------------------------
@@ -143,7 +89,6 @@ else:
     metadata = []
     print("Initialized new memory index.")
 
-
 def save_index():
     """Persist the Faiss index and metadata to disk."""
     try:
@@ -155,21 +100,17 @@ def save_index():
     except Exception as e:
         print("Error saving index:", e)
 
-
 # ---------------------------
 # Basic Tag Extraction
 # ---------------------------
 def extract_tags(text):
     """
-    Trivial example: split on alphanumeric, keep unique tokens of length >= 4 for 'tags'.
-    In production, you might use a more robust approach 
-    (keyword extraction, spaCy-based NER, etc.).
+    Extract unique tokens of length >= 4 from text for 'tags'.
     """
     text_lower = text.lower()
     tokens = re.findall(r"\w+", text_lower)
     tokens = [t for t in tokens if len(t) >= 4]
     return list(set(tokens))
-
 
 # ---------------------------
 # Gemini Embedding Functions
@@ -177,7 +118,7 @@ def extract_tags(text):
 def get_text_embedding(text):
     """
     Compute text embedding using Gemini's embedding model,
-    optionally L2-normalize for better semantic search with Faiss (IndexFlatL2).
+    with L2-normalization for better semantic search.
     """
     if text in embedding_cache:
         return embedding_cache[text]
@@ -189,7 +130,7 @@ def get_text_embedding(text):
         )
         embedding_array = np.array(result["embedding"], dtype=np.float32)
 
-        # Optional L2 normalization
+        # L2 normalization
         norm = np.linalg.norm(embedding_array)
         if norm > 0:
             embedding_array = embedding_array / norm
@@ -201,7 +142,6 @@ def get_text_embedding(text):
         print("Error getting text embedding:", e)
         return np.zeros((embedding_dim,), dtype=np.float32)
 
-
 # ---------------------------
 # Memory Management Functions
 # ---------------------------
@@ -212,15 +152,15 @@ def toggle_memory(state: bool):
     memory_enabled = state
     status = "enabled" if state else "disabled"
     print(f"Memory recording has been {status}.")
-
+    return {"status": status}
 
 def add_to_memory(text, source="unknown", user_id=None, tags=None):
     """
     Add an entry to the persistent memory (Faiss index + metadata).
-    We also auto-extract tags from `text` if not provided.
+    Auto-extracts tags from `text` if not provided.
     """
     if not memory_enabled:
-        return
+        return {"status": "skipped", "reason": "memory recording disabled"}
 
     embedding = get_text_embedding(text)
     vec = embedding.reshape(1, -1)
@@ -240,7 +180,8 @@ def add_to_memory(text, source="unknown", user_id=None, tags=None):
     metadata.append(entry)
     save_index()
     print("Added memory:", entry)
-
+    
+    return {"status": "success", "entry_id": len(metadata) - 1}
 
 def is_personal_preference_query(query):
     """
@@ -250,15 +191,12 @@ def is_personal_preference_query(query):
     q_lower = query.lower()
     return any(kw in q_lower for kw in keywords)
 
-
 # ---------------------------
 # Fuzzy Overlap Helper
 # ---------------------------
 def fuzzy_tag_overlap(entry_tags, query_tags, threshold=80):
     """
     Return how many 'fuzzy-matched' tags we find between two sets of tags.
-    E.g. if entry has ["macbook"] and query has ["macbok"], 
-    ratio might be >= 80 -> counts as match.
     """
     overlap_count = 0
     for qtag in query_tags:
@@ -269,12 +207,9 @@ def fuzzy_tag_overlap(entry_tags, query_tags, threshold=80):
                 break
     return overlap_count
 
-
-def retrieve_from_memory(query, top_k=None):
+def retrieve_from_memory(query, top_k=None, user_id=None):
     """
-    Perform a semantic search over ALL stored memory.
-    If top_k is None, we retrieve everything from the index,
-    then re-rank by distance, recency, preference, plus fuzzy tag overlap.
+    Perform a semantic search over stored memory.
     """
     if len(metadata) == 0:
         return []
@@ -282,6 +217,7 @@ def retrieve_from_memory(query, top_k=None):
     query_embedding = get_text_embedding(query).reshape(1, -1)
     with index_lock:
         k = top_k if top_k is not None else index.ntotal
+        k = min(k, index.ntotal)  # Make sure k is not larger than the index size
         distances, indices = index.search(query_embedding, k)
 
     query_tags = extract_tags(query)
@@ -289,6 +225,11 @@ def retrieve_from_memory(query, top_k=None):
     for i, idx in enumerate(indices[0]):
         if 0 <= idx < len(metadata):
             entry = metadata[idx]
+            
+            # Filter by user_id if provided
+            if user_id is not None and entry.get("user_id") != user_id:
+                continue
+                
             distance = distances[0][i]
             # Convert L2 distance to a "similarity" style
             base_score = 1.0 / (1.0 + distance)
@@ -310,7 +251,6 @@ def retrieve_from_memory(query, top_k=None):
     results.sort(key=lambda x: x[1], reverse=True)
     return [r[0] for r in results]
 
-
 # ---------------------------
 # Token Counting & Summaries
 # ---------------------------
@@ -329,37 +269,33 @@ def count_tokens(text, model="facebook/bart-large-cnn"):
         print("Error counting tokens:", e)
         return len(text.split())
 
-
 def approximate_history_token_count(messages, model="facebook/bart-large-cnn"):
-    return sum(count_tokens(msg["content"], model) for msg in messages)
-
+    return sum(count_tokens(msg.content, model) for msg in messages)
 
 MAX_HISTORY_TOKENS = 3000
 
-# Summarization pipeline on GPU (device=0).
+# Initialize summarization pipeline 
 bart_summarizer = pipeline(
     "summarization",
     model="facebook/bart-large-cnn",
     tokenizer=bart_tokenizer,
-    device=0,             # keep on GPU
-    max_length=150,       # max output length for summary
+    device=-1,  # CPU
+    max_length=150,
     truncation=True
 )
 
 # ---------------------------
 # CHUNKING-BASED SUMMARIZATION
 # ---------------------------
-def chunk_text(text, tokenizer, chunk_size=512): # 1024
+def chunk_text(text, tokenizer, chunk_size=512):
     """
-    Split text into multiple chunks of up to `chunk_size` tokens each
-    so we don't overflow the model's input limit.
+    Split text into multiple chunks of up to `chunk_size` tokens each.
     """
     all_ids = tokenizer.encode(text, add_special_tokens=False)
     chunks = []
     for i in range(0, len(all_ids), chunk_size):
         chunks.append(all_ids[i : i + chunk_size])
     return chunks
-
 
 def summarize_chunk(token_ids, tokenizer, summarizer):
     """
@@ -369,7 +305,6 @@ def summarize_chunk(token_ids, tokenizer, summarizer):
     # Summarize the chunk
     out = summarizer(chunk_text, do_sample=False, min_length=40)
     return out[0]["summary_text"].strip()
-
 
 def chunked_summarize(text, chunk_size=512, pass_count=2):
     # Each pass chunk-summarizes the text, then feeds the combined summary
@@ -399,7 +334,6 @@ def chunked_summarize(text, chunk_size=512, pass_count=2):
 
     return text
 
-
 def prune_history(messages, model="facebook/bart-large-cnn"):
     """
     If chat history is too large, summarize older chunks.
@@ -416,7 +350,7 @@ def prune_history(messages, model="facebook/bart-large-cnn"):
     accumulated = 0
     cutoff_index = 0
     for i, msg in enumerate(recent_messages):
-        msg_tokens = count_tokens(msg["content"], model)
+        msg_tokens = count_tokens(msg.content, model)
         accumulated += msg_tokens
         if accumulated >= tokens_to_remove:
             cutoff_index = i
@@ -424,13 +358,13 @@ def prune_history(messages, model="facebook/bart-large-cnn"):
 
     if cutoff_index > 0:
         # Summarize everything up to cutoff_index with chunked summarization
-        concatenated = "\n".join(msg["content"] for msg in recent_messages[:cutoff_index])
+        concatenated = "\n".join(msg.content for msg in recent_messages[:cutoff_index])
         summary = chunked_summarize(concatenated)
 
         # We store the summary as an assistant message so we remain valid for the model
         pruned_history = [
             system_message,
-            {"role": "assistant", "content": summary}
+            Message(role="assistant", content=summary)
         ]
         pruned_history.extend(recent_messages[cutoff_index:])
 
@@ -440,93 +374,192 @@ def prune_history(messages, model="facebook/bart-large-cnn"):
     else:
         return messages
 
+# ---------------------------
+# FastAPI App Setup
+# ---------------------------
+app = FastAPI(title="Memory-Enhanced LLM API")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------------------
-# Main Chat Loop
+# API Routes
 # ---------------------------
-messages = [
-    {
-        "role": "system",
-        "content": (
-            "You are a helpful assistant with access to a vector-memory system. "
-            "Use the retrieved memory context if relevant."
-        )
-    }
-]
-
-def cli_loop():
-    print("Interactive DeepSeek Chat with Hybrid Fuzzy Tag + Vector Search & Chunked Summaries (type 'exit' to quit)")
-    print("Type 'stop recording memory' to disable memory logging, and 'resume recording memory' to enable it.")
-    print("------------------------------------------------------------")
-
-    while True:
-        user_input = input("\nUser: ")
-        if user_input.lower() in ["exit", "quit", "bye"]:
-            print("\nGoodbye!")
-            break
-
-        if user_input.lower() == "stop recording memory":
-            toggle_memory(False)
-            continue
-        elif user_input.lower() == "resume recording memory":
-            toggle_memory(True)
-            continue
-
-        # Add the user's raw text to memory (with auto-tagging)
-        custom_tags = []
-        # Example: if "macbook" in user_input => custom_tags = ["preference"]
-        if "macbook" in user_input.lower() or "macbooks" in user_input.lower():
-            custom_tags.append("preference")
-
-        add_to_memory(user_input, source="user", user_id="test_user", tags=custom_tags)
-
-        # If user is asking about personal preferences, reformulate slightly
-        if is_personal_preference_query(user_input):
-            reformulated_query = user_input + " (based on my preferences)"
-        else:
-            reformulated_query = user_input
-
-        # Retrieve memory (all)
-        all_entries = retrieve_from_memory(reformulated_query, top_k=None)
-        top_entries = all_entries[:5]
-
-        # Combine top matches into snippet
-        retrieved_context = "\n".join(
-            f"Relevant Memory: {entry['text']} [tags={entry['tags']}]"
-            for entry in top_entries
-        )
-
-        # Place memory context + user message into the conversation
-        augmented_input = f"{retrieved_context}\n\nUser's current message: {user_input}"
-        messages.append({"role": "user", "content": augmented_input})
-
-        # Prune conversation with chunked summarization
-        messages = prune_history(messages)
-
-        # Send to DeepSeek for streaming chat completion
-        try:
-            print("\nDeepSeek: ", end="", flush=True)
-            stream = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=messages,
-                stream=True
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
+    """
+    Chat completion endpoint that enhances requests with memory context.
+    """
+    # Convert Pydantic models to dict for API compatibility
+    messages_dict = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+    
+    # Get the user message (last one if multiple)
+    user_messages = [msg for msg in messages_dict if msg["role"] == "user"]
+    if not user_messages:
+        raise HTTPException(status_code=400, detail="No user message found in the request")
+    
+    user_input = user_messages[-1]["content"]
+    
+    # Extract tags from the user message and add to memory
+    custom_tags = []
+    if "macbook" in user_input.lower() or "macbooks" in user_input.lower():
+        custom_tags.append("preference")
+    
+    add_to_memory(user_input, source="user", user_id="api_user", tags=custom_tags)
+    
+    # Retrieve relevant memory
+    reformulated_query = user_input
+    if is_personal_preference_query(user_input):
+        reformulated_query += " (based on my preferences)"
+    
+    retrieved_entries = retrieve_from_memory(reformulated_query, top_k=5)
+    
+    # Format retrieved context
+    memory_context = "\n".join(
+        f"Relevant Memory: {entry['text']} [tags={entry['tags']}]"
+        for entry in retrieved_entries
+    )
+    
+    # Augment the user's last message with memory context
+    if memory_context:
+        messages_dict[-1]["content"] = f"{memory_context}\n\nUser's current message: {user_input}"
+    
+    # Prune history if needed
+    pydantic_messages = [Message(**msg) for msg in messages_dict]
+    pruned_messages = prune_history(pydantic_messages)
+    pruned_dict = [{"role": msg.role, "content": msg.content} for msg in pruned_messages]
+    
+    # Handle streaming vs. non-streaming differently
+    if request.stream:
+        async def generate():
+            stream = deepseek_client.chat.completions.create(
+                model=request.model,
+                messages=pruned_dict,
+                stream=True,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens
             )
-
+            
             assistant_response = ""
             for chunk in stream:
-                if chunk.choices[0].delta.content is not None:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                     piece = chunk.choices[0].delta.content
                     assistant_response += piece
-                    print(piece, end="", flush=True)
-            print()
-
-            # Record assistant response in memory as well
-            messages.append({"role": "assistant", "content": assistant_response})
-            add_to_memory(assistant_response, source="assistant", user_id="test_user")
-
-        except Exception as e:
-            print(f"\nError during API call: {str(e)}")
+                    
+                    # Convert to the expected format
+                    chunk_json = {
+                        "id": f"chatcmpl-{int(time.time())}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": piece},
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    
+                    yield f"data: {json.dumps(chunk_json)}\n\n"
+            
+            # Record the full response in memory
+            add_to_memory(assistant_response, source="assistant", user_id="api_user")
+            
+            # Send the completion message
+            yield f"data: {json.dumps({'choices': [{'finish_reason': 'stop'}]})}\n\n"
+            yield "data: [DONE]\n\n"
+            
+        return StreamingResponse(generate(), media_type="text/event-stream")
+    else:
+        # Non-streaming response
+        completion = deepseek_client.chat.completions.create(
+            model=request.model,
+            messages=pruned_dict,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens
+        )
         
-# Only run the CLI chat loop if this file is executed directly
+        # Record the assistant's response in memory
+        assistant_response = completion.choices[0].message.content
+        add_to_memory(assistant_response, source="assistant", user_id="api_user")
+        
+        return {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": assistant_response
+                    },
+                    "finish_reason": completion.choices[0].finish_reason,
+                }
+            ],
+        }
+
+@app.post("/memory/add")
+async def add_memory(entry: MemoryEntry):
+    """Add a new entry to the memory store."""
+    result = add_to_memory(
+        text=entry.text,
+        source=entry.source,
+        user_id=entry.user_id,
+        tags=entry.tags
+    )
+    return result
+
+@app.post("/memory/search")
+async def search_memory(request: MemorySearchRequest):
+    """Search the memory store for relevant entries."""
+    results = retrieve_from_memory(
+        query=request.query,
+        top_k=request.top_k,
+        user_id=request.user_id
+    )
+    return {"results": results}
+
+@app.post("/memory/toggle")
+async def memory_toggle(request: MemoryToggleRequest):
+    """Enable or disable memory recording."""
+    return toggle_memory(request.enabled)
+
+@app.get("/memory/status")
+async def memory_status():
+    """Get the current status of the memory system."""
+    return {
+        "enabled": memory_enabled,
+        "entries_count": len(metadata),
+        "index_size": index.ntotal if hasattr(index, "ntotal") else 0
+    }
+
+# ---------------------------
+# Startup and Shutdown Events
+# ---------------------------
+@app.on_event("startup")
+async def startup_event():
+    """Initialize resources on startup."""
+    print("Memory-Enhanced LLM API is starting up...")
+    # Initialize any additional resources here
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up resources on shutdown."""
+    print("Saving memory index before shutdown...")
+    save_index()
+
+# ---------------------------
+# Server Start
+# ---------------------------
 if __name__ == "__main__":
-    cli_loop()
+    uvicorn.run("proxy_server:app", host="0.0.0.0", port=8000, reload=True)
+
