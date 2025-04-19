@@ -33,20 +33,62 @@ The result is a *research sandbox* for long‑lived AI agents you can run on you
 
 ## 2  Architecture overview
 ```mermaid
-flowchart TD
-    subgraph Client
-        A1[CLI] -->|stdin| Core
-        A2[Tk GUI] -->|events| Core
-        A3[HTTP POST /v1/chat/completions] --> API
+flowchart TB
+ %%{init: {'theme': 'base', 'themeVariables': {'fontSize': '20px', 'primaryColor': 'transparent', 'primaryTextColor': '#000000', 'primaryBorderColor': '#000000', 'lineColor': '#000000', 'secondaryColor': 'transparent', 'tertiaryColor': 'transparent'}}}%%
+
+    subgraph "3.1. Input Capture and Preprocessing"
+        A1["<b style='font-size:24px'>Text Input</b>"]
+        B1["<b style='font-size:24px'>Text Processor</b>"]
+        D1["<b style='font-size:24px'>Text Embeddings</b>"]
+        B2["<b style='font-size:24px'>Image Input</b>"]
+        D2["<b style='font-size:24px'>Semantic Understanding</b>"]
+        B3["<b style='font-size:24px'>Audio Input</b>"]
+        D3["<b style='font-size:24px'>Transcribed Text</b>"]
+
+        A1 --> B1
+        B1 --"<b style='font-size:24px'>gemini-embedding-exp-03-07</b>" --> D1
+        B2 -- "<b style='font-size:24px'>llama3.2vision-90B</b>" --> D2
+        D2 --> B1
+        B3 -- "<b style='font-size:24px'>OpenAI Whisper Model</b>" --> D3
+        D3 --> B1
     end
-    Core[deepseek_chat.py] -->|Memory API| M[Faiss + Meta JSON]
-    Core --"DeepSeek REST"--> D[DeepSeek Cloud]
-    M --persist--> storage[(memory.index)]
-    subgraph Multimodal Helpers
-        I[llama3 Vision via Ollama] -.-> Core
-        Au[HF Whisper] -.-> Core
+
+    subgraph "3.2. External Memory Module"
+        A3["<b style='font-size:24px'>Tags</b>"]
+        F2["<b style='font-size:24px'>Local Vector Database</b>"]
+        F5["<b style='font-size:24px'>Relevant Memories from Tags</b>"]
+        D1-- "<b style='font-size:24px'>  FAISS  </b>" -->A3
+        A3 --> F2
+        F2 --> F5
     end
-    API[FastAPI proxy_server.py] --> Core
+
+    subgraph "3.3. Model Input/Output"
+        G1["<b style='font-size:24px'>Deepseek R1 API</b>"]
+    end
+
+    %% Core connections
+    D1 --> F2
+    F5 -- "<b style='font-size:24px'>  Augmented Input  </b>" --> G1
+    G1 -- "<b style='font-size:24px'>  Output  </b>" --> F2
+
+    linkStyle 1 stroke:#999,stroke-width:2px,color:white
+    linkStyle 2 stroke:#999,stroke-width:2px,color:white
+    linkStyle 4 stroke:#999,stroke-width:2px,color:white
+    linkStyle 6 stroke:#999,stroke-width:2px,color:white
+    linkStyle 10 stroke:#999,stroke-width:2px,color:white
+    linkStyle 11 stroke:#999,stroke-width:2px,color:white
+    
+
+    %% Tagging moved outside subgraph to avoid stretching width
+    
+
+    classDef inputSection fill:#e6f3ff,stroke:#6cb2eb,stroke-width:3px,font-size:14px,color:black
+    classDef memorySection fill:#e6ffe6,stroke:#6beb8a,stroke-width:3px,font-size:14px,color:black
+    classDef promptSection fill:#fff0e6,stroke:#ebac6b,stroke-width:3px,font-size:14px,color:black
+
+    class A1,B1,C1,D1,B2,B3,C2,C3,D2,D3,A3 inputSection
+    class F2,F5 memorySection
+    class G1 promptSection
 ```
 *Every surface shares the **same** memory engine and scoring logic.*
 
