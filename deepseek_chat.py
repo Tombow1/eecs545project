@@ -27,7 +27,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import google.generativeai as genai
 
 # Example key; do not hardcode in production
-GEMINI_API_KEY = "AIzaSyDm3hL9ZMIjdz8gI0-Q0wkpuY9SdGYtpuA"
+GEMINI_API_KEY = "AIzaSyAJoyB3HNpInQgGqXeM_t2t3z78Zf5eCDc"
 os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -300,37 +300,84 @@ def summarize_chunk(token_ids, tokenizer, summarizer):
     out = summarizer(chunk_text, do_sample=False, min_length=40)
     return out[0]["summary_text"].strip()
 
+def process_in_chunks(
+    items,
+    chunk_size,
+    process_fn,
+    on_error=None,
+    max_retries=2,
+    delay=1,
+    verbose=True
+):
+    """
+    General utility to process items in chunks with error handling.
+    
+    Args:
+        items (list): List of items to process.
+        chunk_size (int): Max chunk size.
+        process_fn (callable): Function to apply to each chunk.
+        on_error (callable): Fallback function on failure (e.g., lambda chunk: chunk).
+        max_retries (int): Number of retries per chunk.
+        delay (int): Seconds to wait between retries.
+        verbose (bool): Print debug messages.
+    
+    Returns:
+        List of processed results.
+    """
+    results = []
+    for i in range(0, len(items), chunk_size):
+        chunk = items[i:i + chunk_size]
+        attempt = 0
+        while attempt <= max_retries:
+            try:
+                result = process_fn(chunk)
+                results.append(result)
+                break
+            except Exception as e:
+                attempt += 1
+                if verbose:
+                    print(f"Error processing chunk {i // chunk_size + 1}: {e}")
+                if attempt > max_retries:
+                    fallback = on_error(chunk) if on_error else chunk
+                    results.append(fallback)
+                else:
+                    time.sleep(delay * attempt)
+    return results
+
+
+def summarize_chunks(chunk_texts):
+    return [bart_summarizer(text, do_sample=False, min_length=30, max_length=120)[0]["summary_text"].strip() for text in chunk_texts]
 
 def chunked_summarize(text, chunk_size=512, pass_count=2):
-    # Each pass chunk-summarizes the text, then feeds the combined summary
-    # into the next pass if there's more than 1 chunk.
-
     for _ in range(pass_count):
         token_ids = bart_tokenizer.encode(text, add_special_tokens=False)
-        chunks = [
-            token_ids[i : i + chunk_size]
-            for i in range(0, len(token_ids), chunk_size)
-        ]
-        partial_summaries = []
-        for c in chunks:
-            c_text = bart_tokenizer.decode(c, skip_special_tokens=True)
-            try:
-                out = bart_summarizer(c_text, do_sample=False, min_length=30, max_length=120)
-                partial_summaries.append(out[0]["summary_text"].strip())
-            except Exception as e:
-                print("Error summarizing chunk:", e)
-                partial_summaries.append(c_text)  # fallback: keep raw text if chunk fails
+        chunks = [token_ids[i:i+chunk_size] for i in range(0, len(token_ids), chunk_size)]
+        chunk_texts = [bart_tokenizer.decode(ids, skip_special_tokens=True) for ids in chunks]
 
-        text = "\n".join(partial_summaries)
+        partial_summaries = process_in_chunks(
+            chunk_texts,
+            chunk_size=1,  # process each summary individually
+            process_fn=summarize_chunks,
+            on_error=lambda c: c,  # fallback: keep raw chunk text
+            max_retries=1,
+            verbose=True
+        )
 
-        # if there's only one chunk, we've effectively done final summarization
+        text = "\n".join(flatten(partial_summaries))
         if len(chunks) == 1:
             break
 
     return text
 
+def flatten(list_of_lists):
+    return [item for sublist in list_of_lists for item in (sublist if isinstance(sublist, list) else [sublist])]
 
 def prune_history(messages, model="facebook/bart-large-cnn"):
+    """
+    If chat history is too large, summarize older chunks.
+    Uses chunked_summarize() to handle very large text.
+    The summary is inserted into the first user message after the cutoff to maintain role alternation.
+    """
     token_count = approximate_history_token_count(messages, model)
     if token_count <= MAX_HISTORY_TOKENS:
         return messages
@@ -349,25 +396,31 @@ def prune_history(messages, model="facebook/bart-large-cnn"):
             break
 
     if cutoff_index > 0:
-        # Get messages to summarize
-        messages_to_summarize = recent_messages[:cutoff_index]
-
-        # ⚠️ Skip non-user messages for the first message
-        while messages_to_summarize and messages_to_summarize[0]["role"] != "user":
-            messages_to_summarize = messages_to_summarize[1:]
-
-        # Now safely summarize
-        concatenated = "\n".join(msg["content"] for msg in messages_to_summarize)
+        # Summarize everything up to cutoff_index with chunked summarization
+        concatenated = "\n".join(msg["content"] for msg in recent_messages[:cutoff_index])
         summary = chunked_summarize(concatenated)
 
+        updated_messages = recent_messages[cutoff_index:]
 
-        pruned_history = [
-            system_message,
-            {"role": "assistant", "content": f"(Summary of earlier messages)\n{summary}"}
-        ]
-        pruned_history = recent_messages[cutoff_index:].extend(pruned_history)
+        # Insert summary into the first user message after the cutoff
+        for i, msg in enumerate(updated_messages):
+            if msg["role"] == "user":
+                msg["content"] = f"(Summary of earlier conversation)\n{summary}\n\n{msg['content']}"
+                break
+        else:
+            # If no user message found, fallback: insert summary as assistant
+            updated_messages.insert(0, {
+                "role": "assistant",
+                "content": f"(Summary of earlier conversation)\n{summary}"
+            })
+
+        pruned_history = [system_message] + updated_messages
+
+        if approximate_history_token_count(pruned_history, model) > MAX_HISTORY_TOKENS:
+            print("Warning: History still exceeds token limit after summarization.")
 
         return pruned_history
+
     else:
         return messages
 
@@ -407,6 +460,7 @@ async def chat_completions(request: ChatCompletionRequest):
     messages = request.messages
     user_input = " ".join(m["content"] for m in messages if m["role"] == "user")
     
+    
     custom_tags = []
 
     add_to_memory(user_input, source="user", user_id="test_user", tags=custom_tags)
@@ -429,8 +483,6 @@ async def chat_completions(request: ChatCompletionRequest):
 
     # Place memory context + user message into the conversation
     augmented_input = f"{retrieved_context}\n\nUser's current message: {user_input}"
-
-    # Replace the last user message instead of appending
     for i in reversed(range(len(messages))):
         if messages[i]["role"] == "user":
             messages[i]["content"] = augmented_input
@@ -452,6 +504,7 @@ async def chat_completions(request: ChatCompletionRequest):
     messages.append({"role": "assistant", "content": assistant_response.choices[0].message.content})
     add_to_memory(assistant_response.choices[0].message.content, source="assistant", user_id="test_user")
     
+
     return assistant_response
 
 
