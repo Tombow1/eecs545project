@@ -94,10 +94,7 @@ def add_audio_to_memory(path: str):
 
 
 # ─────────────────────────────────────────────────────────────────────
-
-
-# Example key; do not hardcode in production
-GEMINI_API_KEY = "AIzaSyAJoyB3HNpInQgGqXeM_t2t3z78Zf5eCDc"
+GEMINI_API_KEY = "your api key here"
 os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -106,8 +103,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 # ---------------------------
 import openai
 
-# Example key; do not hardcode in production
-openai_api_key = "sk-1a85e3e5f39f4b2587615e72c99aa63e"
+openai_api_key = "your api key ehre"
 os.environ["DEEPSEEK_API_KEY"] = openai_api_key
 
 openai.api_key = openai_api_key
