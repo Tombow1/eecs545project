@@ -1,0 +1,5 @@
+chroma_db
+__pycache__
+memory.index
+memory_meta.json
+conversation_history.json
