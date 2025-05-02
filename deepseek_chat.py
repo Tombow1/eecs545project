@@ -27,7 +27,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import google.generativeai as genai
 
 # Example key; do not hardcode in production
-GEMINI_API_KEY = "AIzaSyAJoyB3HNpInQgGqXeM_t2t3z78Zf5eCDc"
+GEMINI_API_KEY = "your key here"
 os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
 genai.configure(api_key=GEMINI_API_KEY)
 
@@ -37,7 +37,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 import openai
 
 # Example key; do not hardcode in production
-openai_api_key = "sk-5ec02f12083d4f97aad73e1adb3a6f48"
+openai_api_key = "your key here"
 os.environ["DEEPSEEK_API_KEY"] = openai_api_key
 
 openai.api_key = openai_api_key

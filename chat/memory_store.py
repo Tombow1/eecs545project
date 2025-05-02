@@ -10,7 +10,7 @@ from collections import OrderedDict
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('memory_store')
 
-GEMINI_API_KEY = "AIzaSyDm3hL9ZMIjdz8gI0-Q0wkpuY9SdGYtpuA"
+GEMINI_API_KEY = "your key here"
 genai.configure(api_key=GEMINI_API_KEY)
 
 embedding_dim = 3072

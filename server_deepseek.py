@@ -50,13 +50,13 @@ class MemoryToggleRequest(BaseModel):
 # ---------------------------
 # Gemini Embedding Configuration
 # ---------------------------
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDm3hL9ZMIjdz8gI0-Q0wkpuY9SdGYtpuA")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "your key here")
 genai.configure(api_key=GEMINI_API_KEY)
 
 # ---------------------------
 # Chat API Client Configuration (DeepSeek)
 # ---------------------------
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-5ec02f12083d4f97aad73e1adb3a6f48")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "your key here")
 deepseek_client = openai.OpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com"
