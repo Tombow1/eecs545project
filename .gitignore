@@ -1,0 +1,11 @@
+__pycache__/
+chat/__pycache__/
+
+memory_meta.json
+chat/memory_meta.json
+memory.index
+chat/memory.index
+
+conversation_history.json
+
+chroma_db/
